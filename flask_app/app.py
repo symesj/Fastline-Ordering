@@ -1,4 +1,4 @@
-﻿from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session
 import base64, os
 from werkzeug.utils import secure_filename
 from datetime import datetime
@@ -10,18 +10,55 @@ from graph_sharepoint import (                        # new: SharePoint upload h
 )
 
 app = Flask(__name__)
+app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "change-this-secret")
+app.config.setdefault("SESSION_COOKIE_HTTPONLY", True)
+app.config.setdefault("SESSION_COOKIE_SAMESITE", "Lax")
 
 # --- Config ---
 API_KEY = os.getenv("API_KEY", "super-secret-one-liner")
 MAX_ATTACH_TOTAL_MB = 20  # Graph hard limit is 150MB, but keep safer
+AUTH_USERNAME = os.getenv("AUTH_USERNAME", "admin")
+AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "password123")
 
 # --- Helpers ---
 def _require_key(req):
     key = req.headers.get("x-api-key")
     return key == API_KEY
 
+def _has_valid_session():
+    return session.get("user") is not None
+
+def _is_authenticated(req):
+    return _has_valid_session() or _require_key(req)
+
 def _sum_bytes(attachments):
     return sum(len(a.get("contentBytes_b64", b"")) for a in attachments)
+
+# --- Auth routes ---
+@app.post("/api/auth/login")
+def login():
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+
+    data = request.get_json(force=True)
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+
+    if not username or not password:
+        return jsonify({"error": "username and password are required"}), 400
+
+    if username != AUTH_USERNAME or password != AUTH_PASSWORD:
+        session.clear()
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    session.clear()
+    session["user"] = username
+    return jsonify({"ok": True, "user": username}), 200
+
+@app.post("/api/auth/logout")
+def logout():
+    session.clear()
+    return jsonify({"ok": True}), 200
 
 # --- Health check ---
 @app.get("/health")
@@ -32,7 +69,7 @@ def health():
 @app.route("/send-email", methods=["POST"])
 def send_email():
     # ---- security
-    if not _require_key(request):
+    if not _is_authenticated(request):
         return jsonify({"error": "Forbidden"}), 403
 
     attachments = []
@@ -115,7 +152,7 @@ def send_email():
 @app.post("/sharepoint/upload")
 def sp_upload():
     # Security
-    if not _require_key(request):
+    if not _is_authenticated(request):
         return jsonify({"error": "Forbidden"}), 403
 
     # Accepts JSON: { "local_path": "D:\\Orders\\FLG-...\\quote.pdf",
