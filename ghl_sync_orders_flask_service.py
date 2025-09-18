@@ -1,77 +1,3 @@
-# GHL Sync & Orders – Flask Service
-# ------------------------------------------------------------
-# What this gives you
-# - A production‑ready Flask service to:
-#   1) Sync Contacts & Opportunities from GHL on a schedule
-#   2) Receive GHL webhooks (e.g., order/payment events) and log/process them
-#   3) Create internal Orders, generate a PDF, save to SharePoint, email the customer
-# - Uses SQLAlchemy (SQLite by default) for durable logging
-# - Ready for Windows service via NSSM
-# ------------------------------------------------------------
-
-"""
-QUICK START
-===========
-1) Create a Python venv and install requirements.txt
-
-   python -m venv venv
-   venv\Scripts\activate
-   pip install -r requirements.txt
-
-2) Copy .env.example to .env and fill in your secrets.
-
-3) Initialize the DB (SQLite by default):
-
-   python app.py --init-db
-
-4) Run locally
-
-   python app.py
-   # Service will start on http://127.0.0.1:5000 (or PORT from .env)
-
-5) Set up Windows service (PowerShell, run as Admin) with NSSM
-
-   $svc = "ghl_sync_service"
-   nssm install $svc "C:\\Users\\fladmin\\Documents\\flask_app\\venv\\Scripts\\python.exe" \
-       "C:\\Users\\fladmin\\Documents\\flask_app\\app.py"
-   nssm set $svc AppDirectory "C:\\Users\\fladmin\\Documents\\flask_app"
-   nssm set $svc AppEnvironmentExtra "FLASK_ENV=production"
-   nssm start $svc
-
-6) Point GHL webhooks to:
-
-   https://<your-public-host>/webhooks/ghl
-
-   (Use your IIS/NGINX reverse proxy or RDP+NGINX to expose port 5000 safely.)
-
-7) Manual sync trigger:
-
-   POST http://127.0.0.1:5000/sync/ghl  with header  x-api-key: <SYNC_API_KEY>
-
-"""
-
-# ------------------------
-# requirements.txt
-# ------------------------
-# Flask==3.0.3
-# python-dotenv==1.0.1
-# requests==2.32.3
-# SQLAlchemy==2.0.34
-# apscheduler==3.10.4
-# reportlab==4.2.2           # for PDF generation
-# msal==1.30.0               # for Microsoft Graph auth (client credentials)
-# tenacity==8.5.0            # robust retries
-
-
-# ------------------------
-# .env.example (copy to .env and fill in)
-# ------------------------
-# FLASK_ENV=production
-# PORT=5000
-# X_API_KEY=super-secret-one-liner
-# SYNC_API_KEY=super-secret-one-liner
-# DB_URL=sqlite:///ghl_sync.db
-# LOG_LEVEL=INFO
 #
 # # GHL
 # GHL_BASE_URL=https://rest.gohighlevel.com/v1
@@ -97,6 +23,8 @@ import json
 import logging
 from datetime import datetime, timedelta
 from dataclasses import dataclass
+from functools import wraps
+from pathlib import Path
 
 from flask import Flask, request, jsonify, abort
 from dotenv import load_dotenv
@@ -108,12 +36,14 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 import requests
 
 # ---------- Load env
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
-PORT = int(os.getenv("PORT", 5000))
+PORT = int(os.getenv("PORT", 5050))
 X_API_KEY = os.getenv("X_API_KEY", "")
 SYNC_API_KEY = os.getenv("SYNC_API_KEY", X_API_KEY)
-DB_URL = os.getenv("DB_URL", "sqlite:///ghl_sync.db")
+DEFAULT_DB_PATH = BASE_DIR / "ghl_sync.db"
+DB_URL = os.getenv("DB_URL", f"sqlite:///{DEFAULT_DB_PATH.as_posix()}")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 GHL_BASE_URL = os.getenv("GHL_BASE_URL", "https://rest.gohighlevel.com/v1")
@@ -128,6 +58,8 @@ MS_SENDER = os.getenv("MS_SENDER", "sales@fastlinegroup.com")
 SP_SITE_HOST = os.getenv("SP_SITE_HOST", "fastline1.sharepoint.com")
 SP_SITE_PATH = os.getenv("SP_SITE_PATH", "/sites/flg")
 SP_DOCLIB = os.getenv("SP_DOCLIB", "Shared Documents")
+
+DATA_DIR = BASE_DIR / "data"
 
 # ---------- Logging
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -154,9 +86,7 @@ class WebhookEvent(Base):
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
     event_type: Mapped[str]
     payload_json: Mapped[str]
-    processed: Mapped[bool] = mapped_column(default=False)
-    error: Mapped[str] = mapped_column(default="")
-
+@@ -160,60 +166,70 @@ class WebhookEvent(Base):
 class Order(Base):
     __tablename__ = "orders"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -182,14 +112,24 @@ app = Flask(__name__)
 
 def require_api_key(header_name: str, expected: str):
     def decorator(fn):
+        @wraps(fn)
         def wrapper(*args, **kwargs):
             key = request.headers.get(header_name, "")
             if expected and key != expected:
                 abort(403)
             return fn(*args, **kwargs)
-        wrapper.__name__ = fn.__name__
+
         return wrapper
+
     return decorator
+
+
+def graph_configured() -> bool:
+    return all([MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET, MS_SENDER])
+
+
+def sharepoint_configured() -> bool:
+    return graph_configured() and all([SP_SITE_HOST, SP_SITE_PATH, SP_DOCLIB])
 
 
 # ---------- GHL Client (minimal, extend as needed)
@@ -217,9 +157,7 @@ class GHLClient:
     @retry(wait=wait_exponential(multiplier=1, min=1, max=20), stop=stop_after_attempt(5))
     def get_opportunities(self, location_id: str, page=1, limit=100):
         params = {"locationId": location_id, "page": page, "limit": limit}
-        url = f"{self.base_url}/opportunities/"
-        r = self.session.get(url, params=params, timeout=30)
-        r.raise_for_status()
+@@ -223,110 +239,116 @@ class GHLClient:
         return r.json()
 
     def create_note(self, contact_id: str, body: str):
@@ -245,6 +183,8 @@ _graph_cache: GraphToken | None = None
 def _get_graph_token() -> str:
     # simple in-memory token cache using client credentials
     global _graph_cache
+    if not graph_configured():
+        raise RuntimeError("Microsoft Graph credentials are not configured")
     if _graph_cache and _graph_cache.expires_at > datetime.utcnow() + timedelta(minutes=2):
         return _graph_cache.access_token
 
@@ -267,6 +207,8 @@ def _get_graph_token() -> str:
 
 def upload_to_sharepoint(file_path: str, dest_folder: str = "Orders") -> str:
     """Upload a file to SharePoint doc library and return webUrl."""
+    if not sharepoint_configured():
+        raise RuntimeError("SharePoint configuration is incomplete; skipping upload")
     access_token = _get_graph_token()
     # Resolve site & drive
     site_url = f"https://graph.microsoft.com/v1.0/sites/{SP_SITE_HOST}:{SP_SITE_PATH}"
@@ -305,6 +247,8 @@ def upload_to_sharepoint(file_path: str, dest_folder: str = "Orders") -> str:
 
 
 def send_email_via_graph(to: list[str], subject: str, html_body: str, attachments: list[tuple[str, bytes]] | None = None):
+    if not graph_configured():
+        raise RuntimeError("Microsoft Graph credentials are not configured; cannot send email")
     access_token = _get_graph_token()
     msg = {
         "message": {
@@ -330,74 +274,7 @@ def send_email_via_graph(to: list[str], subject: str, html_body: str, attachment
     url = f"https://graph.microsoft.com/v1.0/users/{MS_SENDER}/sendMail"
     r = requests.post(url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, json=msg, timeout=30)
     if r.status_code not in (202, 200):
-        logger.error("Graph sendMail error %s %s", r.status_code, r.text)
-        r.raise_for_status()
-
-
-# ---------- PDF generator
-
-def generate_order_pdf(order: Order) -> bytes:
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    text = c.beginText(40, 800)
-    text.textLine("Fastline Group – Order Confirmation")
-    text.textLine("")
-    text.textLine(f"Order ID: {order.id}")
-    text.textLine(f"Customer: {order.customer_name} <{order.customer_email}>")
-    text.textLine(f"Total: {order.total} {order.currency}")
-    text.textLine(f"Date: {order.created_at.strftime('%Y-%m-%d %H:%M UTC')}")
-    c.drawText(text)
-    c.showPage()
-    c.save()
-    buf.seek(0)
-    return buf.read()
-
-
-# ---------- Sync + Webhook logic
-
-ghl = GHLClient(GHL_API_KEY, GHL_BASE_URL)
-
-
-def run_contacts_sync(updated_since: datetime | None = None) -> dict:
-    sess = SessionLocal()
-    log = SyncLog(scope="contacts", status="running")
-    sess.add(log)
-    sess.commit()
-
-    try:
-        page = 1
-        total = 0
-        while True:
-            data = ghl.get_contacts(page=page, limit=100, updated_since=updated_since)
-            items = data.get("contacts") or data.get("items") or []
-            total += len(items)
-            logger.info("Fetched %s contacts on page %s", len(items), page)
-            if not items or len(items) < 100:
-                break
-            page += 1
-
-        log.status = "success"
-        log.items = total
-        log.finished_at = datetime.utcnow()
-        sess.commit()
-        return {"synced": total}
-    except Exception as e:
-        logger.exception("Contact sync failed")
-        log.status = "error"
-        log.message = str(e)
-        log.finished_at = datetime.utcnow()
-        sess.commit()
-        return {"error": str(e)}
-    finally:
-        sess.close()
-
-
-def process_webhook(event_type: str, payload: dict) -> None:
-    """Minimal example: capture events and create orders on a specific event type."""
-    sess = SessionLocal()
-    try:
-        # Persist raw event
-        wh = WebhookEvent(event_type=event_type, payload_json=json.dumps(payload))
+@@ -401,80 +423,87 @@ def process_webhook(event_type: str, payload: dict) -> None:
         sess.add(wh)
         sess.commit()
 
@@ -423,19 +300,23 @@ def process_webhook(event_type: str, payload: dict) -> None:
             # Generate PDF
             pdf_bytes = generate_order_pdf(order)
             pdf_name = f"Order-{order.id}.pdf"
-            pdf_path = os.path.join(os.getcwd(), "data", pdf_name)
-            os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
+            pdf_path = DATA_DIR / pdf_name
+            pdf_path.parent.mkdir(parents=True, exist_ok=True)
             with open(pdf_path, "wb") as f:
                 f.write(pdf_bytes)
 
             # Upload to SharePoint (per Jon's requirement)
-            try:
-                sp_url = upload_to_sharepoint(pdf_path, dest_folder="Orders")
-            except Exception as e:
-                logger.error("SharePoint upload failed: %s", e)
+            if sharepoint_configured():
+                try:
+                    sp_url = upload_to_sharepoint(str(pdf_path), dest_folder="Orders")
+                except Exception as e:
+                    logger.error("SharePoint upload failed: %s", e)
+                    sp_url = ""
+            else:
+                logger.info("SharePoint not configured; skipping upload")
                 sp_url = ""
 
-            order.pdf_path = pdf_path
+            order.pdf_path = str(pdf_path)
             order.sharepoint_url = sp_url
             sess.commit()
 
@@ -447,12 +328,15 @@ def process_webhook(event_type: str, payload: dict) -> None:
                 <p>You can also view it on SharePoint (internal): {sp_url or '—'}</p>
                 <p>Cheers,<br/>Fastline Team</p>
             """
-            try:
-                send_email_via_graph([customer_email] if customer_email else [MS_SENDER], subject, html, attachments=[(pdf_name, pdf_bytes)])
-                order.status = "emailed"
-                sess.commit()
-            except Exception as e:
-                logger.error("Email send failed: %s", e)
+            if graph_configured():
+                try:
+                    send_email_via_graph([customer_email] if customer_email else [MS_SENDER], subject, html, attachments=[(pdf_name, pdf_bytes)])
+                    order.status = "emailed"
+                    sess.commit()
+                except Exception as e:
+                    logger.error("Email send failed: %s", e)
+            else:
+                logger.info("Email not configured; skipping send")
 
             wh.processed = True
             sess.commit()
@@ -478,26 +362,7 @@ def healthz():
 def sync_ghl():
     """Manual sync trigger. Optionally pass updated_since (ISO8601) in JSON."""
     body = request.get_json(silent=True) or {}
-    ts = body.get("updated_since")
-    updated_since = None
-    if ts:
-        try:
-            updated_since = datetime.fromisoformat(ts)
-        except Exception:
-            pass
-    result = run_contacts_sync(updated_since)
-    return jsonify(result)
-
-
-@app.post("/webhooks/ghl")
-def webhook_ghl():
-    # If GHL supports a signature header for verification, add verification here.
-    event_type = request.headers.get("X-Event-Type") or (request.json or {}).get("event") or "unknown"
-    payload = request.json or {}
-    logger.info("Webhook: %s", event_type)
-    process_webhook(event_type, payload)
-    return {"received": True}
-
+@@ -501,76 +530,83 @@ def webhook_ghl():
 
 @app.post("/orders")
 @require_api_key("x-api-key", X_API_KEY)
@@ -523,19 +388,23 @@ def create_order():
 
         pdf_bytes = generate_order_pdf(order)
         pdf_name = f"Order-{order.id}.pdf"
-        pdf_path = os.path.join(os.getcwd(), "data", pdf_name)
-        os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
+        pdf_path = DATA_DIR / pdf_name
+        pdf_path.parent.mkdir(parents=True, exist_ok=True)
         with open(pdf_path, "wb") as f:
             f.write(pdf_bytes)
 
         # Upload to SharePoint
-        sp_url = ""
-        try:
-            sp_url = upload_to_sharepoint(pdf_path, dest_folder="Orders")
-        except Exception as e:
-            logger.error("SharePoint upload failed: %s", e)
+        if sharepoint_configured():
+            try:
+                sp_url = upload_to_sharepoint(str(pdf_path), dest_folder="Orders")
+            except Exception as e:
+                logger.error("SharePoint upload failed: %s", e)
+                sp_url = ""
+        else:
+            logger.info("SharePoint not configured; skipping upload")
+            sp_url = ""
 
-        order.pdf_path = pdf_path
+        order.pdf_path = str(pdf_path)
         order.sharepoint_url = sp_url
         order.status = "pending"
         sess.commit()
@@ -543,12 +412,15 @@ def create_order():
         # Email
         subject = "Your Fastline Order Confirmation"
         html = f"<p>Hi {name or 'there'},</p><p>Your order is attached.</p>"
-        try:
-            send_email_via_graph([email] if email else [MS_SENDER], subject, html, attachments=[(pdf_name, pdf_bytes)])
-            order.status = "emailed"
-            sess.commit()
-        except Exception as e:
-            logger.error("Email send failed: %s", e)
+        if graph_configured():
+            try:
+                send_email_via_graph([email] if email else [MS_SENDER], subject, html, attachments=[(pdf_name, pdf_bytes)])
+                order.status = "emailed"
+                sess.commit()
+            except Exception as e:
+                logger.error("Email send failed: %s", e)
+        else:
+            logger.info("Email not configured; skipping send")
 
         return {"ok": True, "order_id": order.id, "sharepoint_url": sp_url}
     finally:
@@ -574,10 +446,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.init_db:
-        Base.metadata.create_all(engine)
-        print("DB initialized at:", DB_URL)
-    else:
-        # Ensure DB exists
-        Base.metadata.create_all(engine)
-        scheduler.start()
-        app.run(host="0.0.0.0", port=PORT)

@@ -1,4 +1,15 @@
-﻿from flask import Flask, request, jsonify
+﻿from __future__ import annotations
+
+import os
+
+from . import app as application
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("FLASK_APP_PORT", os.getenv("PORT", 5000)))
+    application.run(host="0.0.0.0", port=port)
+
+from flask import Flask, request, jsonify
 import base64, os
 from werkzeug.utils import secure_filename
 from datetime import datetime
