@@ -9,6 +9,9 @@
 # MS_CLIENT_ID=REDACTED
 # MS_CLIENT_SECRET=REDACTED
 # MS_SENDER=sales@fastlinegroup.com
+#
+# ADMIN_USERNAME=admin
+# ADMIN_PASSWORD=super-secret
 # SP_SITE_HOST=fastline1.sharepoint.com
 # SP_SITE_PATH=/sites/flg
 # SP_DOCLIB=Shared Documents
@@ -21,6 +24,7 @@
 import os
 import json
 import logging
+import secrets
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from functools import wraps
@@ -45,6 +49,8 @@ SYNC_API_KEY = os.getenv("SYNC_API_KEY", X_API_KEY)
 DEFAULT_DB_PATH = BASE_DIR / "ghl_sync.db"
 DB_URL = os.getenv("DB_URL", f"sqlite:///{DEFAULT_DB_PATH.as_posix()}")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 
 GHL_BASE_URL = os.getenv("GHL_BASE_URL", "https://rest.gohighlevel.com/v1")
 GHL_API_KEY = os.getenv("GHL_API_KEY", "")
@@ -60,6 +66,9 @@ SP_SITE_PATH = os.getenv("SP_SITE_PATH", "/sites/flg")
 SP_DOCLIB = os.getenv("SP_DOCLIB", "Shared Documents")
 
 DATA_DIR = BASE_DIR / "data"
+
+ISSUED_SESSIONS: dict[str, datetime] = {}
+SESSION_DURATION = timedelta(hours=1)
 
 # ---------- Logging
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -86,7 +95,6 @@ class WebhookEvent(Base):
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
     event_type: Mapped[str]
     payload_json: Mapped[str]
-@@ -160,60 +166,70 @@ class WebhookEvent(Base):
 class Order(Base):
     __tablename__ = "orders"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -157,7 +165,6 @@ class GHLClient:
     @retry(wait=wait_exponential(multiplier=1, min=1, max=20), stop=stop_after_attempt(5))
     def get_opportunities(self, location_id: str, page=1, limit=100):
         params = {"locationId": location_id, "page": page, "limit": limit}
-@@ -223,110 +239,116 @@ class GHLClient:
         return r.json()
 
     def create_note(self, contact_id: str, body: str):
@@ -272,85 +279,41 @@ def send_email_via_graph(to: list[str], subject: str, html_body: str, attachment
             })
 
     url = f"https://graph.microsoft.com/v1.0/users/{MS_SENDER}/sendMail"
-    r = requests.post(url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, json=msg, timeout=30)
+    r = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        json=msg,
+        timeout=30,
+    )
     if r.status_code not in (202, 200):
-@@ -401,80 +423,87 @@ def process_webhook(event_type: str, payload: dict) -> None:
-        sess.add(wh)
-        sess.commit()
+        logger.error("Graph sendMail failed: %s %s", r.status_code, r.text)
+        raise RuntimeError("Microsoft Graph sendMail request failed")
 
-        # Example: suppose GHL posts an "order.created" type (adjust to your actual payload)
-        if event_type.lower() in {"order.created", "invoice.payment_succeeded", "checkout.order.created"}:
-            customer_email = payload.get("customer", {}).get("email", "") or payload.get("contact", {}).get("email", "")
-            customer_name = payload.get("customer", {}).get("name", "") or payload.get("contact", {}).get("name", "")
-            ghl_contact_id = str(payload.get("contact", {}).get("id", ""))
-            amount = float(payload.get("amount_total", payload.get("total", 0))) / (100.0 if payload.get("amount_total") else 1.0)
-            currency = (payload.get("currency") or "GBP").upper()
-
-            order = Order(
-                ghl_contact_id=ghl_contact_id,
-                customer_email=customer_email,
-                customer_name=customer_name,
-                total=amount,
-                currency=currency,
-                status="pending",
-            )
-            sess.add(order)
-            sess.commit()  # get order.id for PDF
-
-            # Generate PDF
-            pdf_bytes = generate_order_pdf(order)
-            pdf_name = f"Order-{order.id}.pdf"
-            pdf_path = DATA_DIR / pdf_name
-            pdf_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(pdf_path, "wb") as f:
-                f.write(pdf_bytes)
-
-            # Upload to SharePoint (per Jon's requirement)
-            if sharepoint_configured():
-                try:
-                    sp_url = upload_to_sharepoint(str(pdf_path), dest_folder="Orders")
-                except Exception as e:
-                    logger.error("SharePoint upload failed: %s", e)
-                    sp_url = ""
-            else:
-                logger.info("SharePoint not configured; skipping upload")
-                sp_url = ""
-
-            order.pdf_path = str(pdf_path)
-            order.sharepoint_url = sp_url
-            sess.commit()
-
-            # Email customer (and CC internal if desired)
-            subject = "Your Fastline Order Confirmation"
-            html = f"""
-                <p>Hi {customer_name or 'there'},</p>
-                <p>Thanks for your order with Fastline Group. Your confirmation is attached.</p>
-                <p>You can also view it on SharePoint (internal): {sp_url or '—'}</p>
-                <p>Cheers,<br/>Fastline Team</p>
-            """
-            if graph_configured():
-                try:
-                    send_email_via_graph([customer_email] if customer_email else [MS_SENDER], subject, html, attachments=[(pdf_name, pdf_bytes)])
-                    order.status = "emailed"
-                    sess.commit()
-                except Exception as e:
-                    logger.error("Email send failed: %s", e)
-            else:
-                logger.info("Email not configured; skipping send")
-
-            wh.processed = True
-            sess.commit()
-
-    except Exception as e:
-        logger.exception("Webhook processing failed")
-        if 'wh' in locals():
-            wh.error = str(e)
-            sess.commit()
-    finally:
-        sess.close()
+    # request-id header is often useful for tracing, return it if present
+    return r.headers.get("request-id", "")
 
 
 # ---------- Routes
+
+@app.post("/login")
+def login():
+    payload = request.get_json(silent=True) or {}
+    username = str(payload.get("username", ""))
+    password = str(payload.get("password", ""))
+
+    if not ADMIN_USERNAME or not ADMIN_PASSWORD:
+        logger.warning("Admin credentials not configured; rejecting login")
+        return jsonify({"ok": False, "error": "auth_not_configured"}), 401
+
+    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+        expires_at = datetime.utcnow() + SESSION_DURATION
+        token = secrets.token_urlsafe(32)
+        ISSUED_SESSIONS[token] = expires_at
+        return {"token": token, "expires_at": expires_at.isoformat() + "Z"}
+
+    logger.info("Invalid login attempt for user '%s'", username)
+    return jsonify({"ok": False, "error": "invalid_credentials"}), 401
+
 
 @app.get("/healthz")
 def healthz():
@@ -362,7 +325,6 @@ def healthz():
 def sync_ghl():
     """Manual sync trigger. Optionally pass updated_since (ISO8601) in JSON."""
     body = request.get_json(silent=True) or {}
-@@ -501,76 +530,83 @@ def webhook_ghl():
 
 @app.post("/orders")
 @require_api_key("x-api-key", X_API_KEY)
@@ -446,3 +408,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.init_db:
+        Base.metadata.create_all(engine)
+        print("Database initialized at", DEFAULT_DB_PATH)
+    else:
+        scheduler.start()
+        app.run(host="0.0.0.0", port=PORT)
