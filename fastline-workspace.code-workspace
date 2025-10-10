@@ -1,0 +1,16 @@
+{
+  "folders": [
+    {
+      "name": "Frontend",
+      "path": "./ghl-custom-frontend"
+    },
+    {
+      "name": "Flask Backend", 
+      "path": "./flask_app"
+    }
+  ],
+  "settings": {
+    "terminal.integrated.cwd": "${workspaceFolder:Frontend}",
+    "terminal.integrated.defaultProfile.windows": "PowerShell"
+  }
+}
