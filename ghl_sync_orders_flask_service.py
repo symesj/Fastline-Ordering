@@ -107,6 +107,30 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 
 import requests
 
+# --- GoHighLevel OAuth Token Management ---
+GHL_CLIENT_ID = os.getenv("GHL_CLIENT_ID", "")
+GHL_CLIENT_SECRET = os.getenv("GHL_CLIENT_SECRET", "")
+GHL_OAUTH_TOKEN_URL = "https://marketplace.leadconnectorhq.com/oauth/token"
+
+_ghl_token_cache = {"access_token": None, "expires_at": None}
+
+def get_ghl_oauth_token():
+    now = datetime.utcnow()
+    if _ghl_token_cache["access_token"] and _ghl_token_cache["expires_at"] > now:
+        return _ghl_token_cache["access_token"]
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": GHL_CLIENT_ID,
+        "client_secret": GHL_CLIENT_SECRET,
+        "scope": "locations.readonly contacts.readonly opportunities.readonly conversations.readonly"
+    }
+    resp = requests.post(GHL_OAUTH_TOKEN_URL, data=data, timeout=30)
+    resp.raise_for_status()
+    tok = resp.json()
+    _ghl_token_cache["access_token"] = tok["access_token"]
+    _ghl_token_cache["expires_at"] = now + timedelta(seconds=tok.get("expires_in", 3600) - 60)
+    return tok["access_token"]
+
 # ---------- Load env
 load_dotenv()
 
@@ -194,6 +218,23 @@ def require_api_key(header_name: str, expected: str):
 
 # ---------- GHL Client (minimal, extend as needed)
 class GHLClient:
+    def get_conversations(self, location_id: str, page=1, limit=100, access_token: str = None):
+        """
+        Conversations live on the LeadConnector services API rather than the legacy /v1 endpoint.
+        """
+        params = {"locationId": location_id, "page": page, "limit": limit}
+        token = access_token if access_token else self.api_key
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Version": "2021-07-28",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Location-Id": location_id,
+        }
+        url = "https://services.leadconnectorhq.com/conversations/search"
+        r = requests.get(url, params=params, headers=headers, timeout=60)
+        r.raise_for_status()
+        return r.json()
     def __init__(self, api_key: str, base_url: str = GHL_BASE_URL):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -353,7 +394,64 @@ def generate_order_pdf(order: Order) -> bytes:
     return buf.read()
 
 
+def load_cached_oauth_token() -> str | None:
+    """Try to load a stored OAuth access token for the default account."""
+    candidate_paths = [
+        os.path.join(os.getcwd(), "ghl-custom-frontend", "data", "oauth_tokens.json"),
+        os.path.join(os.getcwd(), "data", "oauth_tokens.json"),
+    ]
+    for p in candidate_paths:
+        try:
+            if not os.path.exists(p):
+                continue
+            with open(p, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            # Prefer token stored under known user keys
+            for key in ("default", "jon"):
+                token = data.get(key, {}).get("accessToken")
+                if token:
+                    return token
+            # Fallback: search any entry with accessToken
+            for entry in data.values():
+                if isinstance(entry, dict) and entry.get("accessToken"):
+                    return entry["accessToken"]
+        except Exception as exc:
+            logger.warning("Failed to load cached OAuth token from %s: %s", p, exc)
+    return None
+
+
 # ---------- Sync + Webhook logic
+
+def run_conversations_sync(location_id: str, access_token: str = None) -> dict:
+    """Fetch GHL conversations and save to FastlineSync/conversations-<locationId>.json"""
+    import os
+    import json
+    import logging
+    logger = logging.getLogger("ghl-sync")
+    sync_dir = os.path.join(os.getcwd(), "ghl-custom-frontend", "FastlineSync")
+    os.makedirs(sync_dir, exist_ok=True)
+    all_conversations = []
+    page = 1
+    try:
+        # Try provided token, then cached, then fresh OAuth
+        token_to_use = access_token or load_cached_oauth_token()
+        if not token_to_use:
+            token_to_use = get_ghl_oauth_token()
+        while True:
+            data = ghl.get_conversations(location_id, page=page, limit=100, access_token=token_to_use)
+            items = data.get("conversations") or data.get("items") or []
+            all_conversations.extend(items)
+            if not items or len(items) < 100:
+                break
+            page += 1
+        file_path = os.path.join(sync_dir, f"conversations-{location_id}.json")
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(all_conversations, f, ensure_ascii=False, indent=2)
+        logger.info("Fetched %s conversations for location %s", len(all_conversations), location_id)
+        return {"synced": len(all_conversations), "file": file_path}
+    except Exception as e:
+        logger.exception("Conversations sync failed for location %s", location_id)
+        return {"error": str(e)}
 
 ghl = GHLClient(GHL_API_KEY, GHL_BASE_URL)
 
@@ -476,7 +574,7 @@ def healthz():
 @app.post("/sync/ghl")
 @require_api_key("x-api-key", SYNC_API_KEY)
 def sync_ghl():
-    """Manual sync trigger. Optionally pass updated_since (ISO8601) in JSON."""
+    """Manual sync trigger. Optionally pass updated_since (ISO8601) and access_token in JSON."""
     body = request.get_json(silent=True) or {}
     ts = body.get("updated_since")
     updated_since = None
@@ -485,8 +583,13 @@ def sync_ghl():
             updated_since = datetime.fromisoformat(ts)
         except Exception:
             pass
-    result = run_contacts_sync(updated_since)
-    return jsonify(result)
+    access_token = body.get("access_token")
+    contacts_result = run_contacts_sync(updated_since)
+    conversations_result = run_conversations_sync(GHL_LOCATION_ID, access_token=access_token)
+    return jsonify({
+        "contacts": contacts_result,
+        "conversations": conversations_result
+    })
 
 
 @app.post("/webhooks/ghl")
@@ -561,6 +664,7 @@ def scheduled_sync():
     # Last 2 hours incremental window, adjust as needed
     updated_since = datetime.utcnow() - timedelta(hours=2)
     run_contacts_sync(updated_since)
+    run_conversations_sync(GHL_LOCATION_ID)
 
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(scheduled_sync, 'interval', minutes=30)
